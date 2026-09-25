@@ -1,6 +1,6 @@
 # Vera Merchant AI Assistant
 
-**Public bot URL:** Add the deployed HTTPS base URL here.
+**Public bot URL:** https://magicpin-ai-challenge-by-harshitgahlaut.onrender.com
 
 ## Approach
 
