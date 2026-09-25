@@ -72,6 +72,8 @@ def _customer_message(category: dict, merchant: dict, trigger: dict, customer: d
     payload = trigger.get("payload", {})
     ident = customer.get("identity", {})
     cust_name = str(ident.get("name") or "there")
+    language_pref = str(ident.get("language_pref", "")).lower()
+    hindi_english_mix = "mix" in language_pref or ("hi" in language_pref and "en" in language_pref)
     biz = _name(merchant)
     consent = customer.get("consent", {})
     scopes = {str(s).lower() for s in consent.get("scope", [])}
@@ -112,18 +114,35 @@ def _customer_message(category: dict, merchant: dict, trigger: dict, customer: d
         if is_lapsed:
             detail = f" It's been {payload['days_since_last_visit']} days since your last visit." if payload.get("days_since_last_visit") is not None else f" We'd be glad to {service}."
         else:
-            detail = f" Your {service} is due" + (f" on {due}" if due else "") + "."
+            last_service = payload.get("last_service_date")
+            service_code = str(payload.get("service_due", "")).lower()
+            if category_slug == "dentists" and "clean" in service_code and due and last_service:
+                detail = f" Your last cleaning was on {last_service}; your cleaning recall is due on {due}."
+            else:
+                detail = f" Your {service} is due" + (f" on {due}" if due else "") + "."
         if offer:
             detail += f" Current offer: {offer}."
         if slot_labels:
-            detail += " We have " + " or ".join(slot_labels[:2]) + "."
-        detail += " Would you like us to help arrange a time?"
+            due_day = str(due or "")[:10]
+            before_due = any(
+                isinstance(slot, dict)
+                and len(due_day) == 10
+                and len(str(slot.get("iso", ""))[:10]) == 10
+                and str(slot.get("iso", ""))[:10] < due_day
+                for slot in slots
+            )
+            timing = " before your due date" if before_due else ""
+            detail += " We have " + " or ".join(slot_labels[:2]) + timing + "."
+            detail += " Aapke liye inme se kaunsa time theek rahega?" if hindi_english_mix else " Which of those times works for you?"
+        else:
+            detail += " Aapko kaunsa time suit karega?" if hindi_english_mix else " Would you like us to help arrange a time?"
         body = f"Hi {cust_name}, {biz} here.{detail} Reply STOP if you don't want these reminders."
         cta = "open_ended"
     elif kind == "appointment_tomorrow":
         appointment = payload.get("appointment_time") or payload.get("appointment") or payload.get("slot")
         when = f" for {appointment}" if appointment else " tomorrow"
-        body = f"Hi {cust_name}, a reminder from {biz}: your appointment is{when}. Please reply if you need to make a change. Reply STOP to opt out."
+        change_prompt = "Agar time change karna ho, please reply." if hindi_english_mix else "Please reply if you need to make a change."
+        body = f"Hi {cust_name}, a reminder from {biz}: your appointment is{when}. {change_prompt} Reply STOP to opt out."
         cta = "open_ended"
     elif kind == "wedding_package_followup":
         wedding = payload.get("wedding_date")
@@ -148,6 +167,8 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
         return _customer_message(category, merchant, trigger, customer)
     name = _name(merchant)
     first = _owner(merchant)
+    if merchant.get("category_slug", category.get("slug", "")) == "dentists" and not first.lower().startswith(("dr.", "doctor ")):
+        first = f"Dr. {first}"
     city = merchant.get("identity", {}).get("city")
     payload = trigger.get("payload", {}) or {}
     kind = str(trigger.get("kind", ""))
@@ -163,17 +184,25 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
         summary = item.get("summary") or item.get("title", "")
         segment = item.get("patient_segment")
         segment_phrase = ""
-        if segment and segment in ("high_risk_adults", "high_risk_adult") and aggregate.get("high_risk_adult_count"):
-            segment_phrase = f" Relevant to your {aggregate['high_risk_adult_count']} high-risk adults."
+        if segment and segment in ("high_risk_adults", "high_risk_adult") and "high_risk_adult_cohort" in merchant.get("signals", []):
+            segment_phrase = " Relevant to your high-risk adult cohort."
         trial = f" ({item['trial_n']:,}-person study)" if item.get("trial_n") else ""
-        body = f"{first}, this week's {category.get('display_name', 'category')} digest: {item.get('title', summary)}{trial}.{segment_phrase} {summary} Source: {item.get('source', 'provided digest')}. Want me to pull the details and draft a shareable customer note?"
+        finding = "3-month vs 6-month result" if "3-month" in summary and "6-month" in summary else "finding"
+        note_type = "patient note" if category.get("slug") == "dentists" else "customer note"
+        audience = " for your high-risk adult patients" if segment_phrase else ""
+        body = f"{first}, this week's {category.get('display_name', 'category')} digest: {item.get('title', summary)}{trial}.{segment_phrase} {summary} Source: {item.get('source', 'provided digest')}. I can turn this {finding} into a {note_type}{audience}. Want me to draft it now?"
         rationale = f"Uses the supplied digest item and source, with merchant cohort context when available."
     elif kind == "regulation_change" and item:
         deadline = payload.get("deadline_iso") or item.get("date")
         body = f"{first}, a relevant update from {item.get('source', 'the supplied category digest')}: {item.get('title', item.get('summary', ''))}"
-        if deadline:
+        if deadline and str(deadline) not in str(item.get("title", "")):
             body += f" Effective {deadline}."
-        body += " Would you like a short checklist based on this update?"
+        if body and body[-1] not in ".!?":
+            body += "."
+        if deadline:
+            body += " Want a quick checklist for updating your radiograph dose-limit protocol before that date?"
+        else:
+            body += " Want a quick checklist for updating your radiograph dose-limit protocol?"
         rationale = "Compliance note cites only the supplied category item and deadline."
     elif kind in ("cde_opportunity", "trial_followup") and item:
         body = f"{first}, {item.get('title', 'a category learning opportunity')} ({item.get('source', 'category context')}). {item.get('summary', '')} Want the practical takeaways?"
@@ -242,7 +271,7 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
         if distance is not None:
             body += f" ({distance} km away)"
         if payload.get("opened_date"):
-            body += f" since {payload['opened_date']}"
+            body += f" on {payload['opened_date']}"
         if payload.get("locality"):
             body += f" in {payload['locality']}"
         their_offer = payload.get("their_offer")
@@ -373,7 +402,7 @@ def respond(conversation_id: str, message: str, from_role: str = "merchant", tur
     repeats = state.setdefault("auto_reply_candidates", {})
     count = repeats.get(normalized, 0) + 1
     repeats[normalized] = count
-    auto_like = count >= 2 or any(pattern in normalized for pattern in AUTO_REPLY_PATTERNS)
+    auto_like = count >= 3 or any(pattern in normalized for pattern in AUTO_REPLY_PATTERNS)
     if auto_like:
         if state.get("auto_reply_followup_sent"):
             return {"action": "end", "rationale": "Repeated or recognizable canned auto-reply; stop after one brief check-in."}
